@@ -156,8 +156,14 @@ class VisualOdometry:
         if not is_lost and len(self._keyframes) > 0:
             last_kf_pose = self._keyframes[-1]['pose']
             dist_from_kf = np.linalg.norm(pose_wc.t - last_kf_pose.t)
-            # Re-keyframe if moved > 0.15m, parallax > 20px, or inlier count dropping
-            if (parallax >= self.parallax_thresh or dist_from_kf >= 0.15 or n_inliers < self.min_inliers * 1.5) and (
+            R_diff = pose_wc.R @ last_kf_pose.R.T
+            cos_a = np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
+            angle_deg = np.degrees(np.arccos(cos_a))
+
+            # Only trigger a new keyframe when camera has translated by >= 0.20m OR rotated by >= 15°
+            # This prevents stationary hover or slight tilt from stacking redundant depth layers
+            significant_motion = (dist_from_kf >= 0.20 or angle_deg >= 15.0)
+            if significant_motion and (parallax >= self.parallax_thresh or n_inliers < self.min_inliers * 1.6) and (
                 self._frames_since_kf >= self.min_kf_gap
             ):
                 is_kf = True
