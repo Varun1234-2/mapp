@@ -20,16 +20,18 @@ Live Stream Usage Examples
   # Pi drone live stream over UDP
   python slam_mapper.py --src "udp://@:5600" --env outdoor --calib calib.npz
 
-Outputs (on quit or 's' key)
------------------------------
-  map.ply          — coloured point cloud (Open3D / MeshLab / CloudCompare)
-  trajectory.txt   — KITTI-format poses (one 3×4 row per frame)
-  occupancy.png    — top-down occupancy grid from a height slice
+Outputs
+-------
+  Saved under: records/<TIMESTAMP_YYYYMMDD_HHMMSS>/
+    - map.ply          (coloured 3D point cloud)
+    - trajectory.txt   (KITTI-format 6-DoF camera poses)
+    - occupancy.png    (top-down 2D floorplan occupancy grid)
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
 import os
 import sys
@@ -69,8 +71,8 @@ def parse_args() -> argparse.Namespace:
         help="Horizontal FOV estimate in degrees (used if no calib, default 66).",
     )
     p.add_argument(
-        "--out-dir", default=".",
-        help="Directory for output files (map.ply, trajectory.txt, occupancy.png).",
+        "--out-dir", default=None,
+        help="Base directory for output records (default: records/<timestamp>).",
     )
     p.add_argument(
         "--voxel-size", type=float, default=None,
@@ -117,12 +119,24 @@ def build_camera_matrix(
     return K, None
 
 
+def get_record_dir(custom_dir: str | None = None) -> str:
+    """Generate timestamped session folder under records/ (e.g. records/20261112_143000)."""
+    if custom_dir:
+        os.makedirs(custom_dir, exist_ok=True)
+        return custom_dir
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    session_dir = os.path.join("records", timestamp)
+    os.makedirs(session_dir, exist_ok=True)
+    return session_dir
+
+
 def save_outputs(
     out_dir: str,
     mapper: DenseMapper,
     trajectory: list[Pose],
 ) -> None:
-    """Write map.ply, trajectory.txt, and occupancy.png."""
+    """Write map.ply, trajectory.txt, and occupancy.png into the session directory."""
     os.makedirs(out_dir, exist_ok=True)
     ply_path = os.path.join(out_dir, "map.ply")
     traj_path = os.path.join(out_dir, "trajectory.txt")
@@ -135,6 +149,7 @@ def save_outputs(
         for pose in trajectory:
             f.write(pose.to_kitti_row() + "\n")
     logging.info("Saved %d poses → %s", len(trajectory), traj_path)
+    logging.info("All session files stored in: %s", os.path.abspath(out_dir))
 
 
 # --------------------------------------------------------------------------- #
@@ -145,6 +160,10 @@ def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
     log = logging.getLogger("slam_mapper")
+
+    # ---- initialize output session folder (records/YYYYMMDD_HHMMSS) ---------
+    session_dir = get_record_dir(args.out_dir)
+    log.info("Session records folder initialized: %s", os.path.abspath(session_dir))
 
     # ---- video reader -------------------------------------------------------
     reader = VideoReader(args.src)
@@ -241,13 +260,13 @@ def main() -> None:
                     break
                 elif key == ord("s"):
                     log.info("Manual save triggered")
-                    save_outputs(args.out_dir, mapper, vo.get_trajectory())
+                    save_outputs(session_dir, mapper, vo.get_trajectory())
 
     except KeyboardInterrupt:
         log.info("Interrupted")
 
     # ---- Final save ---------------------------------------------------------
-    save_outputs(args.out_dir, mapper, vo.get_trajectory())
+    save_outputs(session_dir, mapper, vo.get_trajectory())
 
     # ---- Timing report ------------------------------------------------------
     if n_frames > 0:

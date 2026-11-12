@@ -33,7 +33,8 @@ ENV/
 env.bak/
 venv.bak/
 
-# SLAM run outputs & models
+# SLAM records output directory & temporary data
+records/
 *.ply
 trajectory.txt
 occupancy.png
@@ -49,4 +50,3 @@ occupancy.png
 *~
 .DS_Store
 Thumbs.db
-
