@@ -52,12 +52,16 @@ class MapVisualizer:
         """Create the Open3D window (must be called from the main thread)."""
         self._vis = o3d.visualization.Visualizer()
         self._vis.create_window(
-            window_name=self._win_name, width=960, height=720,
+            window_name=self._win_name, width=960, height=720, visible=True
         )
+        # Pump initial window events so width and height are properly initialized in Open3D
+        self._vis.poll_events()
+        self._vis.update_renderer()
+
         opt = self._vis.get_render_option()
         opt.point_size = 2.0
         opt.background_color = np.array([0.1, 0.1, 0.1])
-        logger.info("Open3D visualiser created")
+        logger.info("Open3D visualiser created and initialized")
 
     def update(
         self,
@@ -70,7 +74,7 @@ class MapVisualizer:
         cloud: o3d.geometry.PointCloud,
         trajectory: Sequence[Pose],
     ) -> bool:
-        """Push new data to both windows.  Returns False if user closed O3D."""
+        """Push new data to both windows. Returns False if user closed O3D."""
         # ---- Open3D ----
         if not self._update_3d(cloud, trajectory):
             return False
@@ -93,7 +97,7 @@ class MapVisualizer:
         if key == ord("q"):
             return True
         if key == ord("s"):
-            return False  # 's' handled by caller for saving
+            return False
         return False
 
     def last_key(self) -> int:
@@ -118,7 +122,7 @@ class MapVisualizer:
             self._cloud_geom.points = cloud.points
             self._cloud_geom.colors = cloud.colors
             if not self._cloud_added:
-                vis.add_geometry(self._cloud_geom)
+                vis.add_geometry(self._cloud_geom, reset_bounding_box=True)
                 self._cloud_added = True
             else:
                 vis.update_geometry(self._cloud_geom)
@@ -140,16 +144,13 @@ class MapVisualizer:
                 np.ascontiguousarray(colors, dtype=np.float64)
             )
             if not self._traj_added:
-                vis.add_geometry(self._traj_geom)
+                vis.add_geometry(self._traj_geom, reset_bounding_box=False)
                 self._traj_added = True
             else:
                 vis.update_geometry(self._traj_geom)
 
         vis.poll_events()
         vis.update_renderer()
-
-        # Open3D returns False from poll_events when window is closed on
-        # some platforms, but not all.  We cannot rely on it.
         return True
 
     # ------------------------------------------------------------------ #
@@ -172,11 +173,8 @@ class MapVisualizer:
         self._fps_filter = 0.9 * self._fps_filter + 0.1 * fps
 
         hud = frame.copy()
-        h, w = hud.shape[:2]
-
-        # Status colour
         colour = (0, 0, 255) if is_lost else (0, 255, 0)
-        status = "LOST" if is_lost else "TRACKING"
+        status = "TRACKING LOST" if is_lost else "TRACKING OK"
 
         lines = [
             f"FPS: {self._fps_filter:.1f}",
@@ -184,13 +182,12 @@ class MapVisualizer:
             f"Features: {n_features}",
             f"Inliers: {n_inliers}",
             f"Keyframes: {kf_count}",
-            f"Scale: {scale:.3f}",
+            f"Scale: {scale:.2f}",
         ]
         for i, line in enumerate(lines):
             cv2.putText(
-                hud, line, (10, 25 + 25 * i),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2,
+                hud, line, (12, 28 + 26 * i),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, colour, 2,
             )
 
         cv2.imshow("SLAM Feed", hud)
-
