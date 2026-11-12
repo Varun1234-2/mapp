@@ -18,8 +18,8 @@ Usage
   # From a folder of images
   python calibrate.py --images "cal_imgs/*.jpg" --rows 9 --cols 6
 
-The checkerboard size is *inner corners* (e.g. a 10×7-square board has
-9×6 inner corners).
+The checkerboard size is *inner corners* (e.g. a 10x7-square board has
+9x6 inner corners).
 """
 
 from __future__ import annotations

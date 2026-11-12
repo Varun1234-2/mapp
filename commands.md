@@ -149,3 +149,4 @@ Open `records/<FOLDER_NAME>/occupancy.png` in any image viewer.
 | `--no-vis` | Flag | Headless execution without GUI display windows. |
 | `--out-dir` | `records/<timestamp>` | Specify a custom destination path for output files. |
 | `-v`, `--verbose` | Flag | Enables detailed DEBUG-level logging. |
+

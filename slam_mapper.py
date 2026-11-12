@@ -232,12 +232,8 @@ def main() -> None:
                 t_depth_total += t_depth
                 n_depth += 1
 
-                # Scale update via triangulation
-                tri = vo.triangulate_against_ref(frame)
-                if tri is not None:
-                    pts_3d, pts_2d = tri
-                    vo.update_scale(depth, pts_3d, pts_2d)
-
+                # Register 3D metric landmarks for continuous PnP tracking
+                vo.register_keyframe(frame, depth, result.pose_wc)
                 mapper.add_keyframe(frame, depth, result.pose_wc)
 
             # ---- Visualisation -----------------------------------------------
