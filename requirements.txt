@@ -1,0 +1,12 @@
+# Ground-station dependencies
+# Install PyTorch with CUDA first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+opencv-contrib-python>=4.8
+numpy>=1.24,<2.0
+open3d>=0.17
+transformers>=4.35
+Pillow>=9.0
+scipy>=1.10
+# Onboard (Pi) only — not needed on the ground station:
+# pymavlink>=2.4.41
+
