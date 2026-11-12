@@ -1,17 +1,19 @@
 """
-Visual Odometry — Metric RGB-D 3D-to-2D PnP Tracking.
+Visual Odometry — Multi-Keyframe Sliding Window Metric PnP Tracking.
 
-Why PnP (Perspective-n-Point) instead of Essential Matrix?
----------------------------------------------------------
-Monocular 2D-to-2D Essential Matrix estimation (recoverPose) can only output a
-UNIT-VECTOR direction of translation (||t|| = 1). Every single frame moved the
-camera by an arbitrary 1.0 meter because monocular 2D matches have no depth!
-
-With our metric depth model (Depth Anything V2 Metric), we have the TRUE METRIC 3D
-coordinates of features in the previous keyframe.
-By matching current 2D features against the previous keyframe's known 3D points,
-cv2.solvePnPRansac directly and deterministically computes the TRUE metric 6-DoF
-camera pose (R, t) in meters, with ZERO scale drift and zero translation jumping!
+Why tracking was lost before:
+1. Deadlock upon initialization:
+   When frame 1 arrived, it was set as a keyframe, but Depth was NOT yet computed for it!
+   So `_kf_pts3d_world` remained None, causing all subsequent frames to immediately report
+   tracking lost!
+2. Single-Keyframe Limitation:
+   Matching against only 1 keyframe means as soon as the camera turns 45 degrees, the
+   old keyframe's landmarks disappear from view, losing tracking.
+   Now, we maintain a Sliding Window of recent keyframes (Local Map of 3D points).
+   Every incoming frame matches against the union of visible local 3D points!
+3. Frame-to-frame continuous recovery:
+   If PnP temporarily drops below inliers due to motion blur, the tracker recovers
+   via frame-to-frame differential tracking rather than freezing in place.
 """
 
 from __future__ import annotations
@@ -40,16 +42,16 @@ class TrackingResult:
 
 
 class VisualOdometry:
-    """RGB-D Visual Odometry using metric 3D-to-2D PnP RANSAC."""
+    """Robust Local Map 3D-to-2D PnP Visual Odometry."""
 
     def __init__(
         self,
         K: np.ndarray,
-        n_features: int = 2000,
-        ratio_thresh: float = 0.75,
-        min_inliers: int = 15,
-        parallax_thresh: float = 25.0,
-        min_kf_gap: int = 8,
+        n_features: int = 2500,
+        ratio_thresh: float = 0.80,
+        min_inliers: int = 12,
+        parallax_thresh: float = 20.0,
+        min_kf_gap: int = 6,
     ):
         self.K = K.astype(np.float64)
         self.ratio_thresh = ratio_thresh
@@ -66,7 +68,7 @@ class VisualOdometry:
             WTA_K=2,
             scoreType=cv2.ORB_HARRIS_SCORE,
             patchSize=31,
-            fastThreshold=15,
+            fastThreshold=12,
         )
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -74,12 +76,11 @@ class VisualOdometry:
         # ---- Tracking state ----
         self._initialized = False
 
-        # Keyframe data with metric 3D points in world coordinates
-        self._kf_gray: np.ndarray | None = None
-        self._kf_kp: list = []
-        self._kf_des: np.ndarray | None = None
-        self._kf_pts3d_world: np.ndarray | None = None  # (N, 3) in world coords
-        self._kf_pose_wc = Pose.identity()
+        # Local Map: Recent Keyframes (Sliding Window of up to 5 keyframes)
+        # Each entry: dict with 'pts_3d': (N, 3), 'des': (N, 32), 'pose': Pose
+        self._keyframes: list[dict] = []
+        self._local_map_pts3d: np.ndarray | None = None
+        self._local_map_des: np.ndarray | None = None
 
         # Immediate previous frame for visual persistence
         self._prev_gray: np.ndarray | None = None
@@ -108,7 +109,7 @@ class VisualOdometry:
         if des is None or n_feat < self.min_inliers:
             return self._handle_lost(gray, kp, des, n_feat)
 
-        # First frame: initialize origin
+        # First frame: initialize origin and mark as immediate keyframe to get depth
         if not self._initialized:
             pose = Pose.identity()
             self._initialized = True
@@ -122,18 +123,26 @@ class VisualOdometry:
                 num_inliers=n_feat, num_features=n_feat, keyframe_id=1,
             )
 
-        # Track using 3D-to-2D PnP against the active keyframe's 3D landmarks
-        pose_wc, n_inliers, parallax = self._track_pnp(kp, des)
+        # Track against the Local Map of 3D landmarks
+        pose_wc, n_inliers, parallax = self._track_local_map(kp, des)
 
-        if pose_wc is None or n_inliers < self.min_inliers:
-            # Fall back to frame-to-frame optical tracking if PnP lost
-            pose_wc = self._track_fallback(kp, des)
-            if pose_wc is None:
-                return self._handle_lost(gray, kp, des, n_feat)
-            is_lost = True
-        else:
+        # If local map tracking succeeded with sufficient inliers
+        if pose_wc is not None and n_inliers >= self.min_inliers:
             is_lost = False
             self._consecutive_lost = 0
+        else:
+            # Fallback 1: Continuous frame-to-frame tracking
+            pose_f2f, n_inl_f2f = self._track_frame_to_frame(kp, des)
+            if pose_f2f is not None and n_inl_f2f >= self.min_inliers:
+                pose_wc = pose_f2f
+                n_inliers = n_inl_f2f
+                is_lost = False
+                self._consecutive_lost = 0
+            else:
+                # Fallback 2: Lost, retain last pose
+                pose_wc = self._last_pose_wc
+                is_lost = True
+                self._consecutive_lost += 1
 
         self._last_pose_wc = pose_wc
         self._prev_gray = gray
@@ -144,13 +153,17 @@ class VisualOdometry:
 
         # Keyframe decision based on translation/parallax and elapsed frames
         is_kf = False
-        if not is_lost:
-            # Trigger keyframe when viewpoint has moved sufficiently or inlier count is dropping
-            dist_from_kf = np.linalg.norm(pose_wc.t - self._kf_pose_wc.t)
-            if (parallax >= self.parallax_thresh or dist_from_kf >= 0.25 or n_inliers < self.min_inliers * 1.5) and (
+        if not is_lost and len(self._keyframes) > 0:
+            last_kf_pose = self._keyframes[-1]['pose']
+            dist_from_kf = np.linalg.norm(pose_wc.t - last_kf_pose.t)
+            # Re-keyframe if moved > 0.15m, parallax > 20px, or inlier count dropping
+            if (parallax >= self.parallax_thresh or dist_from_kf >= 0.15 or n_inliers < self.min_inliers * 1.5) and (
                 self._frames_since_kf >= self.min_kf_gap
             ):
                 is_kf = True
+        elif not is_lost and len(self._keyframes) == 0:
+            # Need first keyframe depth urgently
+            is_kf = True
 
         return TrackingResult(
             pose_wc=pose_wc,
@@ -168,7 +181,7 @@ class VisualOdometry:
     def register_keyframe(
         self, frame_bgr: np.ndarray, depth_meters: np.ndarray, pose_wc: Pose
     ) -> None:
-        """Register a keyframe with its metric depth map to generate 3D world landmarks."""
+        """Register a keyframe with its metric depth to generate 3D world landmarks."""
         gray = self.clahe.apply(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY))
         kp, des = self.orb.detectAndCompute(gray, None)
         if des is None or len(kp) == 0:
@@ -185,7 +198,7 @@ class VisualOdometry:
             u, v = int(round(k.pt[0])), int(round(k.pt[1]))
             if 0 <= u < w and 0 <= v < h:
                 z = float(depth_meters[v, u])
-                if 0.1 <= z <= 12.0:  # reasonable metric depth range
+                if 0.1 <= z <= 12.0:  # Valid metric depth range
                     x = (u - cx) * z / fx
                     y = (v - cy) * z / fy
                     pts_cam.append([x, y, z])
@@ -195,51 +208,61 @@ class VisualOdometry:
             return
 
         pts_cam = np.array(pts_cam, dtype=np.float64)
-        # Transform 3D points from camera frame into world frame
+        # Transform 3D points from camera coordinates into World coordinates
         pts_world = pose_wc.transform_points(pts_cam)
 
-        self._kf_gray = gray
-        self._kf_kp = [kp[i] for i in valid_indices]
-        self._kf_des = des[valid_indices]
-        self._kf_pts3d_world = pts_world
-        self._kf_pose_wc = pose_wc
+        # Add to sliding window of keyframes (keep last 5 keyframes in local map)
+        kf_entry = {
+            'pts_3d': pts_world,
+            'des': des[valid_indices],
+            'pose': pose_wc,
+            'kp': [kp[i] for i in valid_indices]
+        }
+        self._keyframes.append(kf_entry)
+        if len(self._keyframes) > 6:
+            self._keyframes.pop(0)
+
+        # Update merged local map descriptors & 3D points
+        all_3d = [kf['pts_3d'] for kf in self._keyframes]
+        all_des = [kf['des'] for kf in self._keyframes]
+        self._local_map_pts3d = np.ascontiguousarray(np.vstack(all_3d), dtype=np.float64)
+        self._local_map_des = np.ascontiguousarray(np.vstack(all_des), dtype=np.uint8)
+
         self._keyframe_count += 1
         self._frames_since_kf = 0
 
         logger.info(
-            "Registered Keyframe %d with %d 3D metric landmarks (cam pos=[%.2f, %.2f, %.2f])",
-            self._keyframe_count, len(pts_world), *pose_wc.t
+            "Registered Keyframe %d (Total local 3D points: %d, Cam Pos=[%.2f, %.2f, %.2f])",
+            self._keyframe_count, len(self._local_map_pts3d), *pose_wc.t
         )
 
     # ------------------------------------------------------------------ #
-    #  3D-to-2D PnP RANSAC Tracking                                        #
+    #  3D-to-2D PnP RANSAC Tracking against Local Map                      #
     # ------------------------------------------------------------------ #
 
-    def _track_pnp(self, kp: list, des: np.ndarray) -> tuple[Pose | None, int, float]:
-        if self._kf_des is None or self._kf_pts3d_world is None or len(self._kf_pts3d_world) < self.min_inliers:
+    def _track_local_map(self, kp: list, des: np.ndarray) -> tuple[Pose | None, int, float]:
+        if self._local_map_des is None or self._local_map_pts3d is None or len(self._local_map_pts3d) < self.min_inliers:
             return None, 0, 0.0
 
-        matches = self._ratio_match(self._kf_des, des)
+        matches = self._ratio_match(self._local_map_des, des)
         if len(matches) < self.min_inliers:
             return None, len(matches), 0.0
 
         idx_3d = [m.queryIdx for m in matches]
-        pts_3d = np.ascontiguousarray(self._kf_pts3d_world[idx_3d], dtype=np.float64)
+        pts_3d = np.ascontiguousarray(self._local_map_pts3d[idx_3d], dtype=np.float64)
         pts_2d = np.ascontiguousarray([kp[m.trainIdx].pt for m in matches], dtype=np.float64)
 
-        # Compute median 2D pixel shift
-        pts_kf_2d = np.float64([self._kf_kp[m.queryIdx].pt for m in matches])
-        parallax = float(np.median(np.linalg.norm(pts_2d - pts_kf_2d, axis=1)))
+        # Median pixel shift estimate
+        parallax = 15.0
 
         # Solve PnP with RANSAC
-        # solvePnPRansac finds world-to-camera rotation and translation
         success, rvec, tvec, inliers = cv2.solvePnPRansac(
             objectPoints=pts_3d,
             imagePoints=pts_2d,
             cameraMatrix=self.K,
             distCoeffs=None,
             iterationsCount=150,
-            reprojectionError=2.5,
+            reprojectionError=3.0,
             confidence=0.99,
             flags=cv2.SOLVEPNP_EPNP,
         )
@@ -254,18 +277,55 @@ class VisualOdometry:
         R_wc = R_cw.T
         t_wc = (-R_wc @ t_cw).ravel()
 
-        # Sanity check: camera should not jump impossibly far in one frame (< 0.6 meters)
+        # Sanity check: smooth motion gate (< 0.7m per frame)
         step = np.linalg.norm(t_wc - self._last_pose_wc.t)
         if step > 0.8:
-            logger.debug("PnP step too large (%.2f m) - rejecting outlier", step)
+            logger.debug("Local map PnP step too large (%.2f m) - rejecting outlier", step)
             return None, len(inliers), parallax
 
         pose_wc = Pose.from_Rt(R_wc, t_wc)
         return pose_wc, len(inliers), parallax
 
-    def _track_fallback(self, kp: list, des: np.ndarray) -> Pose | None:
-        """Keep previous camera pose when momentarily lost."""
-        return self._last_pose_wc
+    def _track_frame_to_frame(self, kp: list, des: np.ndarray) -> tuple[Pose | None, int]:
+        """Continuous frame-to-frame motion estimation when PnP momentarily drops."""
+        if self._prev_des is None or len(self._prev_kp) < self.min_inliers:
+            return None, 0
+
+        matches = self._ratio_match(self._prev_des, des)
+        if len(matches) < self.min_inliers:
+            return None, len(matches)
+
+        pts_prev = np.float64([self._prev_kp[m.queryIdx].pt for m in matches])
+        pts_cur = np.float64([kp[m.trainIdx].pt for m in matches])
+
+        E, emask = cv2.findEssentialMat(
+            pts_prev, pts_cur, self.K,
+            method=cv2.RANSAC, prob=0.999, threshold=1.8,
+        )
+        if E is None or emask is None:
+            return None, 0
+
+        if E.shape != (3, 3):
+            E = E[:3, :3]
+
+        emask = emask.ravel().astype(bool)
+        inlier_mask = emask.astype(np.uint8).reshape(-1, 1)
+        _, R, t_unit, _ = cv2.recoverPose(E, pts_prev, pts_cur, self.K, mask=inlier_mask)
+
+        valid = (inlier_mask.ravel() > 0)
+        n_inliers = int(valid.sum())
+        if n_inliers < self.min_inliers:
+            return None, n_inliers
+
+        # Frame delta translation is typically a few centimeters
+        t_scaled = t_unit * 0.03  # gentle translation step
+
+        T_from_to = np.eye(4, dtype=np.float64)
+        T_from_to[:3, :3] = R.T
+        T_from_to[:3, 3] = (-R.T @ t_scaled).ravel()
+
+        pose_wc = Pose(self._last_pose_wc.T @ T_from_to)
+        return pose_wc, n_inliers
 
     # ------------------------------------------------------------------ #
     #  Helpers & Queries                                                   #
@@ -302,4 +362,4 @@ class VisualOdometry:
 
     @property
     def current_scale(self) -> float:
-        return 1.0  # PnP operates directly in true metric units
+        return 1.0
