@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-slam_mapper.py — Real-time monocular SLAM with metric depth.
+slam_mapper.py — Real-time monocular SLAM with metric depth for live camera streams.
 
-Ground-station entry point.  Reads a video stream (phone / webcam / file /
-drone UDP), runs ORB-based visual odometry, Depth Anything V2 metric depth,
-and builds a coloured 3-D point-cloud map in real time.
+Ground-station entry point. Reads a live camera stream (phone IP camera /
+webcam / drone UDP stream), runs ORB-based visual odometry, Depth Anything V2
+metric depth, and builds a coloured 3-D point-cloud map in real time.
 
-Usage examples
---------------
-  # Phone via IP Webcam (Android)
+Live Stream Usage Examples
+--------------------------
+  # Phone camera via IP Webcam (Android)
   python slam_mapper.py --src "http://192.168.1.42:8080/video" --env indoor
 
-  # Recorded video replay
-  python slam_mapper.py --src recording.mp4 --env indoor
+  # Phone camera via RTSP (iOS / Android)
+  python slam_mapper.py --src "rtsp://192.168.1.42:8554/live" --env indoor
 
-  # Local webcam
-  python slam_mapper.py --src 0 --env indoor --hfov 60
+  # Local USB/built-in webcam (index 0)
+  python slam_mapper.py --src 0 --env indoor --hfov 66
 
-  # Pi drone stream (later)
+  # Pi drone live stream over UDP
   python slam_mapper.py --src "udp://@:5600" --env outdoor --calib calib.npz
 
 Outputs (on quit or 's' key)
@@ -50,11 +50,11 @@ from ground_station.utils import make_camera_matrix, load_calibration, Pose
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Real-time monocular SLAM mapper (ground station)",
+        description="Real-time monocular SLAM mapper for live camera streams",
     )
     p.add_argument(
         "--src", required=True,
-        help="Video source: URL, file path, or webcam index.",
+        help="Live camera source: URL (HTTP/RTSP/UDP) or webcam index (e.g. 0).",
     )
     p.add_argument(
         "--env", choices=["indoor", "outdoor"], default="indoor",
@@ -62,15 +62,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--calib", default=None,
-        help="Path to calib.npz (from calibrate.py).  Overrides --hfov.",
+        help="Path to calib.npz (from calibrate.py). Overrides --hfov.",
     )
     p.add_argument(
         "--hfov", type=float, default=66.0,
         help="Horizontal FOV estimate in degrees (used if no calib, default 66).",
-    )
-    p.add_argument(
-        "--record", default=None,
-        help="Save incoming stream to this MP4 path.",
     )
     p.add_argument(
         "--out-dir", default=".",
@@ -151,7 +147,7 @@ def main() -> None:
     log = logging.getLogger("slam_mapper")
 
     # ---- video reader -------------------------------------------------------
-    reader = VideoReader(args.src, record_path=args.record)
+    reader = VideoReader(args.src)
     K, dist = build_camera_matrix(args, reader.width, reader.height)
 
     # ---- undistortion map (if calibrated) -----------------------------------
@@ -186,16 +182,13 @@ def main() -> None:
     n_frames = 0
     n_depth = 0
 
-    log.info("=== Pipeline running.  Press 'q' to quit, 's' to save. ===")
+    log.info("=== Live Stream Pipeline running. Press 'q' to quit, 's' to save. ===")
 
     try:
         while True:
             frame, ts = reader.get_frame()
             if frame is None:
-                if reader.is_file and reader.finished:
-                    log.info("End of video file")
-                    break
-                time.sleep(0.001)
+                time.sleep(0.002)
                 continue
 
             # Undistort if calibrated
@@ -275,4 +268,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
